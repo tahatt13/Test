@@ -1,3 +1,81 @@
+import numpy as np
+import pandas as pd
+
+def find_multiple_ranges_for_product(prop_df, edge_min_frac=0.001):
+    """
+    prop_df : DataFrame avec colonnes
+              ['STRATEGY_TYPE','UNDERLYING_INSTRUMENT_TYPE','STRIKE_PCT_SPOT_BIN',
+               'TENOR','Proportion']
+              --> déjà filtré pour UN produit donné (strategy + underlying)
+    edge_min_frac : seuil proportion minimale par case (ex: 0.001 = 0,1%)
+    Retourne : liste de dicts { 'strike_min', 'strike_max', 'tenor_min', 'tenor_max', 'mass', 'cells' }
+    """
+    # Pivot table Tenor x Strike
+    pivot = prop_df.pivot_table(
+        index="TENOR", columns="STRIKE_PCT_SPOT_BIN", values="Proportion", fill_value=0.0
+    )
+
+    tenors = list(pivot.index)
+    strikes = list(pivot.columns)
+    M = pivot.values.copy()
+
+    visited = np.zeros_like(M, dtype=bool)
+    cluster_total = M.sum()
+
+    results = []
+
+    while True:
+        # Trouver cellule max non visitée
+        M_masked = np.where(visited, -1, M)  # mettre -1 aux visités pour les ignorer
+        max_idx = np.unravel_index(np.argmax(M_masked), M.shape)
+        max_val = M_masked[max_idx]
+
+        # Stop si plus de case au-dessus du seuil
+        if max_val < edge_min_frac:
+            break
+
+        # Nouvelle graine
+        block_cells = set([max_idx])
+        visited[max_idx] = True
+
+        # Frontière pour BFS
+        frontier = [max_idx]
+        while frontier:
+            i, j = frontier.pop()
+            # Parcourir les voisins (8 directions)
+            for di in [-1, 0, 1]:
+                for dj in [-1, 0, 1]:
+                    if di == 0 and dj == 0:
+                        continue
+                    ni, nj = i + di, j + dj
+                    if 0 <= ni < M.shape[0] and 0 <= nj < M.shape[1]:
+                        if not visited[ni, nj] and M[ni, nj] >= edge_min_frac:
+                            visited[ni, nj] = True
+                            block_cells.add((ni, nj))
+                            frontier.append((ni, nj))
+
+        # Calculer range strike/tenor pour ce bloc
+        rows = [c[0] for c in block_cells]
+        cols = [c[1] for c in block_cells]
+        strike_min = strikes[min(cols)]
+        strike_max = strikes[max(cols)]
+        tenor_min = tenors[min(rows)]
+        tenor_max = tenors[max(rows)]
+
+        mass = sum(M[i, j] for i, j in block_cells)
+
+        results.append({
+            "strike_min": strike_min,
+            "strike_max": strike_max,
+            "tenor_min": tenor_min,
+            "tenor_max": tenor_max,
+            "mass": mass,
+            "cells": [(tenors[i], strikes[j]) for i, j in block_cells]
+        })
+
+    return results
+
+------
 import pandas as pd
 import numpy as np
 
