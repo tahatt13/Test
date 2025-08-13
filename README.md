@@ -1,3 +1,183 @@
+import pandas as pd
+import numpy as np
+
+# ---- robust sort helpers ----
+def _strike_key(x):
+    s = str(x).strip().replace('%','').replace(' ','').replace('+','')
+    if '-' in s:
+        a, _ = s.split('-', 1)
+        try: return float(a)
+        except: return float('inf')
+    try: return float(s)
+    except: return float('inf')
+
+def _tenor_key(x):
+    s = str(x).strip().lower().replace(' ','').replace('m','')
+    try:
+        v = float(s)
+        return v/30.0 if v > 24 else v  # rough days->months
+    except:
+        return float('inf')
+
+def _build_matrix(sub, strike_col, tenor_col, prop_col):
+    strikes = sorted(sub[strike_col].dropna().unique(), key=_strike_key)
+    tenors  = sorted(sub[tenor_col].dropna().unique(),  key=_tenor_key)
+    if len(strikes)==0 or len(tenors)==0:
+        return strikes, tenors, np.zeros((0,0)), None
+    pv = (sub.pivot_table(index=tenor_col, columns=strike_col, values=prop_col,
+                          aggfunc=np.sum, fill_value=0.0)
+            .reindex(index=tenors, columns=strikes, fill_value=0.0))
+    return strikes, tenors, pv.values.astype(float), pv  # keep pivot for labels if needed
+
+def _neighbors8(mask, r, c):
+    R, C = mask.shape
+    for dr in (-1,0,1):
+        for dc in (-1,0,1):
+            if dr==0 and dc==0: 
+                continue
+            rr, cc = r+dr, c+dc
+            if 0 <= rr < R and 0 <= cc < C:
+                yield rr, cc
+
+def _grow_connected_area(M, edge_min_abs):
+    """
+    Greedy growth:
+      - seed = argmax cell
+      - repeatedly add the *neighbor* (8-neighborhood) with max mass >= edge_min_abs
+      - returns selected mask and total mass
+    """
+    R, C = M.shape
+    if R==0 or C==0: 
+        return np.zeros((0,0), dtype=bool), 0.0
+
+    sel = np.zeros((R,C), dtype=bool)
+    r0, c0 = np.unravel_index(np.argmax(M), M.shape)
+    if M[r0, c0] <= 0:
+        return sel, 0.0
+
+    sel[r0, c0] = True
+    total = float(M[r0, c0])
+
+    # frontier = all neighbors of selected set not yet selected
+    while True:
+        best_gain = 0.0
+        best_rc = None
+
+        # collect unique neighbors
+        seen = set()
+        rs, cs = np.where(sel)
+        for r, c in zip(rs, cs):
+            for rr, cc in _neighbors8(sel, r, c):
+                if sel[rr, cc]: 
+                    continue
+                key = (rr, cc)
+                if key in seen: 
+                    continue
+                seen.add(key)
+                gain = float(M[rr, cc])
+                if gain > best_gain:
+                    best_gain = gain
+                    best_rc = key
+
+        if best_rc is None or best_gain < edge_min_abs:
+            break
+
+        rr, cc = best_rc
+        sel[rr, cc] = True
+        total += best_gain
+
+    return sel, total
+
+def find_product_ranges_connected(
+    proportions_df,
+    edge_min_cluster_frac=0.001,  # 0.1% of cluster
+    group_cols=("STRATEGY_TYPE","UNDERLYING_INSTRUMENT_TYPE"),
+    strike_col="STRIKE_PCT_SPOT_BIN",
+    tenor_col="TENOR",
+    prop_col="Proportion"
+):
+    """
+    For each product (strategy, underlying type):
+      - build the strike×tenor mass matrix in *absolute cluster* units (no local normalization)
+      - seed at max cell, grow with 8-neighborhood, adding neighbors only if gain >= edge_min_cluster_frac * cluster_total
+      - return one range: [min_strike..max_strike] × [min_tenor..max_tenor]
+      - report PRODUCT_RANGE_FRAC and CLUSTER_FRAC
+    """
+    # cluster total (after any prior filtering applied to proportions_df)
+    cluster_total = float(proportions_df[prop_col].sum())
+    if cluster_total <= 0:
+        # empty input
+        return pd.DataFrame(columns=list(group_cols)+[
+            "STRIKE_START","STRIKE_END","TENOR_START","TENOR_END",
+            "CLUSTER_FRAC","PRODUCT_RANGE_FRAC","PRODUCT_TOTAL_FRAC",
+            "CELLS_SELECTED"
+        ])
+
+    edge_min_abs = edge_min_cluster_frac * cluster_total
+
+    rows = []
+    for keys, sub in proportions_df.groupby(list(group_cols)):
+        strikes, tenors, M, pv = _build_matrix(sub, strike_col, tenor_col, prop_col)
+        if M.size == 0:
+            rows.append(dict(zip(group_cols, keys), **{
+                "STRIKE_START": None, "STRIKE_END": None,
+                "TENOR_START": None,  "TENOR_END": None,
+                "CLUSTER_FRAC": 0.0,
+                "PRODUCT_RANGE_FRAC": 0.0,
+                "PRODUCT_TOTAL_FRAC": 0.0,
+                "CELLS_SELECTED": []
+            }))
+            continue
+
+        product_total = float(M.sum())  # absolute mass of this product in cluster
+        if product_total <= 0:
+            rows.append(dict(zip(group_cols, keys), **{
+                "STRIKE_START": None, "STRIKE_END": None,
+                "TENOR_START": None,  "TENOR_END": None,
+                "CLUSTER_FRAC": 0.0,
+                "PRODUCT_RANGE_FRAC": 0.0,
+                "PRODUCT_TOTAL_FRAC": 0.0,
+                "CELLS_SELECTED": []
+            }))
+            continue
+
+        sel_mask, sel_mass = _grow_connected_area(M, edge_min_abs=edge_min_abs)
+
+        if sel_mask.sum() == 0:
+            # nothing passes threshold → take only the top cell (ensures at least one)
+            r0, c0 = np.unravel_index(np.argmax(M), M.shape)
+            sel_mask = np.zeros_like(M, dtype=bool)
+            sel_mask[r0, c0] = True
+            sel_mass = float(M[r0, c0])
+
+        # derive strike/tenor ranges from selected cells
+        rs, cs = np.where(sel_mask)
+        t_start = tenors[int(rs.min())]
+        t_end   = tenors[int(rs.max())]
+        k_start = strikes[int(cs.min())]
+        k_end   = strikes[int(cs.max())]
+
+        # list selected label pairs (optional, for debugging/explainability)
+        cells = [(tenors[int(r)], strikes[int(c)], float(M[int(r), int(c)])) for r, c in zip(rs, cs)]
+
+        rows.append(dict(zip(group_cols, keys), **{
+            "STRIKE_START": k_start,
+            "STRIKE_END":   k_end,
+            "TENOR_START":  t_start,
+            "TENOR_END":    t_end,
+            # share of *cluster* covered by this product's range:
+            "CLUSTER_FRAC": float(sel_mass / cluster_total),
+            # share of *this product* covered by the range:
+            "PRODUCT_RANGE_FRAC": float(sel_mass / product_total),
+            # share of cluster that this whole product represents (context):
+            "PRODUCT_TOTAL_FRAC": float(product_total / cluster_total),
+            "CELLS_SELECTED": cells
+        }))
+
+    out = pd.DataFrame(rows).sort_values(list(group_cols)).reset_index(drop=True)
+    return out
+
+
 # Test
 
 
