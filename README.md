@@ -33,11 +33,27 @@ landscape_raw.columns = ['STRAT_BUCKET','Trades','Notional_USD','Vega_USD','Gamm
 landscape = landscape_raw.sort_values('Notional_USD', ascending=False)
 landscape['Share_%'] = 100*landscape['Notional_USD']/landscape['Notional_USD'].sum()
 
-# --- 2) Mix Buy/Sell
-side_pvt = df.pivot_table(values='NOTIONAL_USD', index='STRAT_BUCKET', columns='SIDE', aggfunc='sum', fill_value=0)
-buy_series = side_pvt[[c for c in side_pvt.columns if str(c).upper()=='BUY'][0]] if any(str(c).upper()=='BUY' for c in side_pvt.columns) else 0
+# --- 2) Mix Buy/Sell/TWO_SIDES
+side_pvt = df.pivot_table(values='NOTIONAL_USD',
+                          index='STRAT_BUCKET',
+                          columns='SIDE',
+                          aggfunc='sum',
+                          fill_value=0)
+
+# Colonnes robustes (si elles n'existent pas, on met 0)
+buy  = side_pvt['BUY']  if 'BUY'  in side_pvt.columns else 0
+sell = side_pvt['SELL'] if 'SELL' in side_pvt.columns else 0
+two  = side_pvt['TWO_SIDES'] if 'TWO_SIDES' in side_pvt.columns else 0
+
 side_mix = side_pvt.copy()
-side_mix['Buy_Share_%'] = 100 * buy_series / side_pvt.sum(axis=1)
+side_mix['Total'] = buy + sell + two
+
+# % d’achats = part des notionals BUY sur (BUY+SELL), ignore TWO_SIDES
+side_mix['Buy_Share_%'] = np.where((buy+sell)>0, 100*buy/(buy+sell), np.nan)
+
+# % de TWO_SIDES pour info
+side_mix['Two_Sides_%'] = np.where(side_mix['Total']>0, 100*two/side_mix['Total'], 0)
+
 
 # --- 3) Mix Index vs Stock
 inst_pvt = df.pivot_table(values='NOTIONAL_USD', index='STRAT_BUCKET', columns='UNDERLYING_INSTRUMENT_TYPE', aggfunc='sum', fill_value=0)
