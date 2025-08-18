@@ -1,4 +1,45 @@
-df = final_data.copy()
+
+import numpy as np
+
+df = df.copy()
+
+# helpers pour percentiles (nommés pour éviter <lambda>)
+def p95(x): return np.percentile(x, 95)
+def p5(x):  return np.percentile(x, 5)
+
+g = df.groupby('STRAT_BUCKET')
+
+summary = g.agg({
+    'NOTIONAL_USD': ['count', 'mean', p95],
+    'TENOR_M': ['mean'],
+    'STRIKE_PCT_CLEAN': ['mean', p5, p95],
+    'VEGA_DOLLAR': ['sum'],
+    'GAMMA_DOLLAR': ['sum'],
+})
+
+# aplatir les colonnes MultiIndex -> noms clairs
+summary.columns = [
+    f"{c0}_{(c1 if isinstance(c1,str) else c1.__name__)}"
+    for c0, c1 in summary.columns
+]
+
+# renommer pour matcher exactement ce qu’on voulait
+summary = summary.rename(columns={
+    'NOTIONAL_USD_count': 'n_trades',
+    'NOTIONAL_USD_mean':  'notional_mean',
+    'NOTIONAL_USD_p95':   'notional_p95',
+    'TENOR_M_mean':       'tenor_mean',
+    'STRIKE_PCT_CLEAN_mean': 'strike_pct_mean',
+    'STRIKE_PCT_CLEAN_p5':   'strike_pct_p5',
+    'STRIKE_PCT_CLEAN_p95':  'strike_pct_p95',
+    'VEGA_DOLLAR_sum':    'vega_sum',
+    'GAMMA_DOLLAR_sum':   'gamma_sum',
+}).round(2)
+
+print(summary)
+
+----------
+f = final_data.copy()
 
 # 1) Ta version calculée (strike / spot_px)
 df['STRIKE_OVER_SPOTPX'] = df['STRIKE'] / df['SPOT_PX']
