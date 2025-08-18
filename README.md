@@ -1,3 +1,46 @@
+
+import pandas as pd
+
+def classify_putspread(legs_df):
+    """
+    legs_df: DataFrame avec les deux jambes d'un put spread
+             Colonnes nécessaires: ['strike', 'expiry', 'side'] 
+             (side = 'BUY' ou 'SELL')
+    """
+    if len(legs_df) != 2:
+        return "Not a 2-leg spread"
+    
+    leg1, leg2 = legs_df.iloc[0], legs_df.iloc[1]
+    
+    # même strike ?
+    if leg1['strike'] == leg2['strike']:
+        # comparer maturités
+        if leg1['expiry'] != leg2['expiry']:
+            return "Put Calendar Spread"
+    
+    # même maturité
+    if leg1['expiry'] == leg2['expiry']:
+        strikes = sorted([(leg1['strike'], leg1['side']), (leg2['strike'], leg2['side'])])
+        # strike bas et haut
+        (low_strike, low_side), (high_strike, high_side) = strikes
+        
+        # bull put spread : sell high strike, buy low strike
+        if low_side == 'BUY' and high_side == 'SELL':
+            return "Bull Put Spread"
+        
+        # bear put spread : buy high strike, sell low strike
+        if low_side == 'SELL' and high_side == 'BUY':
+            return "Bear Put Spread"
+    
+    return "Unknown / Complex Put Spread"
+
+# Exemple d’utilisation
+quote_id = 12345  # un exemple
+legs = data_2[data_2['quote_id'] == quote_id]
+spread_type = classify_putspread(legs)
+print(f"Quote {quote_id}: {spread_type}")
+
+-----
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
