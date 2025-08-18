@@ -1,6 +1,143 @@
 
 import pandas as pd
 
+# ==== Helpers ====
+def _norm_side(x):
+    x = str(x).upper()
+    if x in ['B', 'BUY', '1', 'LONG']:
+        return 'BUY'
+    if x in ['S', 'SELL', '-1', 'SHORT']:
+        return 'SELL'
+    return x
+
+def _norm_opt(x):
+    x = str(x).upper()
+    if x.startswith('C'):
+        return 'CALL'
+    if x.startswith('P'):
+        return 'PUT'
+    return x
+
+def _to_dt(x):
+    return pd.to_datetime(x).normalize()
+
+def classify_spread_type(legs_df: pd.DataFrame) -> str:
+    """
+    legs_df: DataFrame (2 lignes) pour un quote_id donné, colonnes minimales:
+      ['option_type', 'side', 'strike', 'expiry']
+    Règles demandées:
+      - Call/Put Vertical Bull/Bear (même expiry, strikes ≠)
+      - Call/Put Calendar (même strike, expiry ≠)
+      - Diagonals (strike ≠ & expiry ≠) -> 'OTHER' (à exclure plus tard)
+      - Tout le reste -> 'OTHER'
+    """
+    df = legs_df.copy()
+
+    # Normalisations
+    df['option_type'] = df['option_type'].map(_norm_opt)
+    df['side']        = df['side'].map(_norm_side)
+    df['expiry']      = df['expiry'].map(_to_dt)
+    df['strike']      = pd.to_numeric(df['strike'], errors='coerce')
+
+    # Garde uniquement 2 jambes valides
+    df = df.dropna(subset=['option_type','side','strike','expiry'])
+    if len(df) != 2 or not set(df['side']).issubset({'BUY','SELL'}):
+        return 'OTHER'
+
+    # Décompose
+    buy  = df[df['side']=='BUY'].iloc[0]  if (df['side']=='BUY').any()  else None
+    sell = df[df['side']=='SELL'].iloc[0] if (df['side']=='SELL').any() else None
+    if buy is None or sell is None:
+        return 'OTHER'
+
+    opt_buy,  opt_sell  = buy['option_type'],  sell['option_type']
+    k_buy,    k_sell    = float(buy['strike']), float(sell['strike'])
+    t_buy,    t_sell    = buy['expiry'],        sell['expiry']
+
+    same_strike = (k_buy == k_sell)
+    same_expiry = (t_buy == t_sell)
+
+    # ---- Calendars (même strike, expiries ≠) ----
+    if same_strike and not same_expiry:
+        if opt_buy == 'CALL' and opt_sell == 'CALL':
+            return 'CALL CALENDAR SPREAD'
+        if opt_buy == 'PUT'  and opt_sell == 'PUT':
+            return 'PUT CALENDAR SPREAD'
+        # si mix d'option_type (anormal) -> OTHER
+        return 'OTHER'
+
+    # ---- Verticals (même expiry, strikes ≠) ----
+    if same_expiry and not same_strike:
+        # CALL verticals
+        if opt_buy == 'CALL' and opt_sell == 'CALL':
+            # Bear = BUY high, SELL low ; Bull = SELL high, BUY low
+            if k_buy > k_sell:
+                return 'CALL SPREAD BEAR'
+            elif k_sell > k_buy:
+                return 'CALL SPREAD BULL'
+            else:
+                return 'OTHER'
+        # PUT verticals
+        if opt_buy == 'PUT' and opt_sell == 'PUT':
+            if k_buy > k_sell:
+                return 'PUT SPREAD BEAR'
+            elif k_sell > k_buy:
+                return 'PUT SPREAD BULL'
+            else:
+                return 'OTHER'
+        # mix CALL/PUT au même expiry -> OTHER
+        return 'OTHER'
+
+    # ---- Diagonals (strikes ≠ & expiries ≠) -> OTHER (à exclure plus tard) ----
+    if (not same_strike) and (not same_expiry):
+        return 'OTHER'
+
+    # Cas résiduels
+    return 'OTHER'
+
+
+# ==== Pipeline d’annotation ====
+# data_2 contient les jambes (legs) avec au moins: quote_id, option_type, side, strike, expiry
+# FINAL_data contient au moins: quote_id
+
+def build_strategy_types(FINAL_data: pd.DataFrame, data_2: pd.DataFrame) -> pd.DataFrame:
+    # restreindre aux legs d'options (si tu as aussi des futures/autres)
+    legs = data_2.copy()
+
+    # Optionnel: ne garder que CALL/PUT
+    legs = legs[legs['option_type'].astype(str).str.upper().str.startswith(('C','P'))]
+
+    # On garde uniquement les quotes qui ont 2 jambes
+    leg_counts = legs.groupby('quote_id').size()
+    valid_quotes = leg_counts[leg_counts == 2].index
+
+    legs2 = legs[legs['quote_id'].isin(valid_quotes)].copy()
+
+    # Classifier par quote_id
+    strategy_rows = []
+    for qid, g in legs2.groupby('quote_id'):
+        stype = classify_spread_type(g)
+        strategy_rows.append({'quote_id': qid, 'STRATEGY_TYPE': stype})
+
+    strat_df = pd.DataFrame(strategy_rows)
+
+    # Merge dans FINAL_data
+    out = FINAL_data.merge(strat_df, on='quote_id', how='left')
+
+    # Par défaut, remplir manquants en OTHER
+    out['STRATEGY_TYPE'] = out['STRATEGY_TYPE'].fillna('OTHER')
+
+    return out
+
+# ==== Exemple d’utilisation ====
+# FINAL_data = build_strategy_types(FINAL_data, data_2)
+
+# ---- Ensuite, pour "enlever" les diagonals (déjà marquées OTHER) ----
+# out_no_diagonals = FINAL_data[FINAL_data['STRATEGY_TYPE'] != 'OTHER'].copy()
+
+----
+import pandas as pd
+
 def classify_putspread(legs_df):
     """
     legs_df: DataFrame avec les deux jambes d'un put spread
