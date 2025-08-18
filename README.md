@@ -1,5 +1,69 @@
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
+
+df = final_data.copy()
+
+# --- 0) Harmoniser (léger) les libellés d’underlying
+if 'UNDERLYING_INSTRUMENT_TYPE' in df.columns:
+    u = df['UNDERLYING_INSTRUMENT_TYPE'].astype(str).str.strip().str.lower()
+    # map souple vers Index / Stock / Other
+    df['UNDER_T_clean'] = np.select(
+        [
+            u.str.contains('index'),                      # "Index", "Indice", "Index Option", etc.
+            u.str.contains('stock|equity|share|action')   # "Stock", "Equity", etc.
+        ],
+        ['Index', 'Stock'],
+        default='Other'
+    )
+else:
+    raise ValueError("Colonne UNDERLYING_INSTRUMENT_TYPE manquante")
+
+# --- 1) Choisir la colonne de stratégie que tu utilises (décommente la bonne)
+STRAT_COL = 'STRATEGY_TYPE'
+# STRAT_COL = 'STRAT_BUCKET'   # si tu préfères utiliser le bucket que tu as construit
+
+# --- 2) Tableau Notional par (Stratégie × Type d’underlying)
+pivot_abs = pd.pivot_table(
+    df, values='NOTIONAL_USD',
+    index=STRAT_COL, columns='UNDER_T_clean',
+    aggfunc='sum', fill_value=0
+)
+
+# S'assurer que les colonnes existent
+for col in ['Index','Stock','Other']:
+    if col not in pivot_abs.columns:
+        pivot_abs[col] = 0.0
+
+# --- 3) % par stratégie (ligne) = notional_col / notional_total_ligne
+total = pivot_abs.sum(axis=1)
+pct = pivot_abs.div(total, axis=0).mul(100).round(1)
+
+# On ne garde que Index / Stock (mais tu peux afficher Other si utile)
+mix_pct = pct[['Index','Stock']].copy()
+
+# --- 4) Ordonner les stratégies par notional total décroissant (plus lisible)
+mix_pct = mix_pct.loc[total.sort_values(ascending=False).index]
+
+print("\n=== % de notional par type d’underlying (par stratégie) ===")
+print(mix_pct)
+
+# --- 5) (Option) Barres empilées pour visualiser
+plt.figure(figsize=(10,6))
+bottom = np.zeros(len(mix_pct))
+for col in ['Index','Stock']:
+    plt.bar(mix_pct.index, mix_pct[col].values, bottom=bottom, label=col)
+    bottom += mix_pct[col].values
+plt.ylabel('% du notional')
+plt.title('Répartition Index vs Stock par stratégie')
+plt.xticks(rotation=45, ha='right')
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+here -----
+import pandas as pd
+import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
 
