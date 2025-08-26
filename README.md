@@ -1,3 +1,17 @@
+Case	Indicator Conditions	Product Suggestion (Construction)	Exit Condition	Why This Works
+Bull – Low IV – Strong Trend	Momentum > 0; Price above SMA50 > SMA200; ADX ≥ 20; IV in bottom 30%	Long Call (Δ≈0.35, DTE 30–60) or Bull Call Debit Spread (Buy Δ≈0.35 call, Sell Δ≈0.25 call, width 5–10% of spot)	Stop if premium loses 50% or trend breaks (price < SMA50). Exit at ≤21 DTE. Take profit at 50–75% of max gain.	Positive delta + long vega benefits from cheap options. Spread limits theta/cost.
+Bull – Neutral IV – Strong Trend	Same as above but IV in 30–70% range	Bull Call Debit Spread (Buy Δ≈0.35, Sell Δ≈0.25, width 5–10%, DTE 30–60)	Trend break or 40–50% loss. Exit at ≤21 DTE. TP at 50–75% of max profit.	Good balance of risk/reward when options are fairly priced.
+Bull – High IV – Strong Trend	Momentum > 0; Trend bullish; ADX ≥ 20; IV in top 30%	Bull Put Credit Spread (Sell Δ≈0.35 put, Buy Δ≈0.20 put, width 5–10%, DTE 30–45)	Stop if price closes below short strike or loss = 1.5× credit. Exit ≤21 DTE or TP 50–70% of credit.	Keeps bullish delta but profits from selling expensive volatility. Defined downside.
+Bull – Weak Trend	Momentum > 0; Trend unclear or ADX < 20	Conservative Bull Call Debit Spread (narrow width 3–6%, DTE 30–45) or No Trade	Exit if momentum flips negative or SMA50 breaks. TP 30–50% of max gain. Exit ≤21 DTE.	When conviction is low, keep exposure small and risk defined.
+Bear – Low IV – Strong Trend	Momentum < 0; Price < SMA50 < SMA200; ADX ≥ 20; IV low (≤30%)	Long Put (Δ≈–0.35, DTE 30–60) or Bear Put Debit Spread (Buy Δ≈–0.35, Sell Δ≈–0.25, width 5–10%)	Stop if premium loses 50% or trend breaks (price > SMA50). Exit ≤21 DTE. TP 50–75% of max gain.	Bearish delta + long vega benefits from cheap puts.
+Bear – Neutral IV – Strong Trend	Same as above but IV in 30–70%	Bear Put Debit Spread (Δ≈–0.35 vs –0.25, width 5–10%, DTE 30–60)	Trend break or 40–50% loss. Exit ≤21 DTE. TP 50–75%.	Controlled risk exposure with mid-range volatility.
+Bear – High IV – Strong Trend	Momentum < 0; Trend bearish; ADX ≥ 20; IV high (>70%)	Bear Call Credit Spread (Sell Δ≈–0.35 call, Buy Δ≈–0.20 call, width 5–10%, DTE 30–45)	Stop if price closes above short strike or loss = 1.5× credit. TP 50–70% credit. Exit ≤21 DTE.	Negative delta + short vega profits from high volatility in downtrends.
+Bear – Weak Trend	Momentum < 0; ADX < 20 or unclear trend	Conservative Bear Put Debit Spread (width 3–6%, DTE 30–45) or No Trade	Exit if momentum flips positive or SMA50 breaks up. TP 30–50%. Exit ≤21 DTE.	Reduces risk in choppy/noisy markets.
+Breakout Confirmation (Bull or Bear)	Price makes new 20-day high (bull) or low (bear), ADX rising, IV neutral–high	Directional Credit Spread: Bull → Bull Put Spread; Bear → Bear Call Spread (width 5–10%, DTE 30–45)	Exit if breakout fails (price back in range) or TP 60–70% credit. Risk = 1.5× credit.	Credit spreads monetize volatility during strong breakouts.
+No Trade (Momentum Off)	ADX < 12 and momentum sign unstable; conflicting signals	Stay flat or switch to mean-reversion book	Wait until ADX ≥ 15–20 and momentum stabilizes	Avoids theta bleed and whipsaws in directionless markets.
+
+<img width="945" height="767" alt="image" src="https://github.com/user-attachments/assets/7739591a-857f-4fb2-960d-5f1479fdee47" />
+
 
 import pandas as pd
 
