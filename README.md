@@ -1,63 +1,84 @@
 
 import pandas as pd
 
-def get_trades_from_signal_with_expiry(signal_series: pd.Series, start_expiry_map: dict):
+def compute_trade_pnls(option_df, trades, fv_col="FV", forbid_overlap=True):
     """
-    Transforme un signal binaire (0/1) en couples (entry_date, exit_date),
-    mais en bornant toujours la sortie par l'expiry du contrat.
+    Compute trade-level PnLs and daily MTM equity from option time series.
 
-    signal_series: pandas Series binaire (0/1) indexée par dates
-    start_expiry_map: dict {startDate: expiryDate} pour tous les starts possibles
+    Parameters
+    ----------
+    option_df : DataFrame
+        Must contain ['startDate','endDate','date', fv_col].
+        One row per day between startDate..endDate inclusive, one contract per startDate.
+    trades : list of (entry, exit)
+        Output of get_trades_from_signal_with_expiry (expiry-capped).
+    fv_col : str, default 'FV'
+        Column with the option fair value.
+    forbid_overlap : bool, default True
+        Skip a trade if its entry <= last trade's exit (no overlapping positions).
 
-    Retourne une liste de tuples (entry_date, exit_date, expiry_date)
+    Returns
+    -------
+    trades_df : DataFrame
+        One row per trade with columns:
+        [entry, exit, expiry, entry_FV, exit_FV, PnL]
+    pnl_ts : DataFrame
+        Daily MTM time series across all trades (index=date, col='MTM').
     """
-    # Décaler le signal d’un jour (on agit le jour suivant)
-    sig = signal_series.shift(1).fillna(0).astype(int)
 
-    trades = []
-    in_trade = False
-    entry_date = None
-    expiry_date = None
+    df = option_df.copy()
+    df["startDate"] = pd.to_datetime(df["startDate"])
+    df["endDate"]   = pd.to_datetime(df["endDate"])
+    df["date"]      = pd.to_datetime(df["date"])
 
-    for date, val in sig.items():
-        if not in_trade and val == 1:
-            # On entre seulement si la date est bien un start listé
-            if date in start_expiry_map:
-                in_trade = True
-                entry_date = date
-                expiry_date = start_expiry_map[date]
+    trades_rows, pnl_chunks = [], []
+    last_exit = None
 
-        elif in_trade:
-            # Cas 1 : signal repasse à 0 avant l’expiry -> sortie anticipée
-            if val == 0 and date <= expiry_date:
-                trades.append((entry_date, date, expiry_date))
-                in_trade = False
-                entry_date = None
-                expiry_date = None
+    for entry, exit in trades:
+        # strict alignment: get the contract starting at entry
+        sub = df[df["startDate"] == entry]
+        if sub.empty:
+            continue
 
-            # Cas 2 : on atteint l’expiry -> sortie forcée
-            elif date == expiry_date:
-                trades.append((entry_date, date, expiry_date))
-                in_trade = False
-                entry_date = None
-                expiry_date = None
+        expiry = sub["endDate"].iloc[0]
+        if exit > expiry:
+            exit = expiry  # safeguard, though trades should already be capped
 
-    # Si jamais un trade n’a pas été fermé (devrait être rare car expiry force la sortie)
-    if in_trade:
-        trades.append((entry_date, expiry_date, expiry_date))
+        if forbid_overlap and last_exit is not None and entry <= last_exit:
+            continue
 
-    return trades
+        trade_path = sub[(sub["date"] >= entry) & (sub["date"] <= exit)].sort_values("date")
+        if trade_path.empty:
+            continue
 
+        entry_fv = float(trade_path.loc[trade_path["date"] == entry, fv_col].iloc[0])
+        exit_fv  = float(trade_path.loc[trade_path["date"] == exit,   fv_col].iloc[0])
+        pnl      = exit_fv - entry_fv
 
-def get_trades_from_signals_with_expiry(signals_df: pd.DataFrame, start_expiry_map: dict):
-    """
-    Applique la logique à un DataFrame avec plusieurs assets en colonnes.
-    Retourne un dict {asset: [(entry, exit, expiry), ...]}.
-    """
-    results = {}
-    for col in signals_df.columns:
-        results[col] = get_trades_from_signal_with_expiry(signals_df[col], start_expiry_map)
-    return results
+        # Daily MTM vs entry
+        tp = trade_path.copy()
+        tp["MTM"] = tp[fv_col] - entry_fv
+        pnl_chunks.append(tp[["date","MTM"]])
+
+        trades_rows.append({
+            "entry": entry,
+            "exit": exit,
+            "expiry": expiry,
+            "entry_FV": entry_fv,
+            "exit_FV": exit_fv,
+            "PnL": pnl
+        })
+        last_exit = exit
+
+    trades_df = pd.DataFrame(trades_rows).sort_values("entry") if trades_rows else pd.DataFrame(
+        columns=["entry","exit","expiry","entry_FV","exit_FV","PnL"]
+    )
+    pnl_ts = (
+        pd.concat(pnl_chunks).set_index("date").sort_index()
+        if pnl_chunks else pd.DataFrame(columns=["MTM"])
+    )
+
+    return trades_df, pnl_ts
 
 ----
 import pandas as pd
