@@ -1,34 +1,15 @@
 
 
-import numpy as np
 import pandas as pd
 
-def make_start_to_expiry_map(start_expiry_dates):
+def entries_exits_from_signal(signal_series: pd.Series):
     """
-    start_expiry_dates: iterable of (start, expiry) pairs (datetime-like)
-    returns: dict {startDate: expiryDate} with DatetimeIndex for keys
-    """
-    df = pd.DataFrame(start_expiry_dates, columns=["startDate","expiry"])
-    df["startDate"] = pd.to_datetime(df["startDate"])
-    df["expiry"]    = pd.to_datetime(df["expiry"])
-    # if multiple entries per start, keep the first (or last) – here first:
-    df = df.drop_duplicates(subset=["startDate"], keep="first").sort_values("startDate")
-    return df.set_index("startDate")["expiry"].to_dict()
-
-def next_listing_on_or_after(d, listed_starts_index):
-    """listed_starts_index: DatetimeIndex sorted (unique startDate values)"""
-    i = np.searchsorted(listed_starts_index.values, np.datetime64(d), side='left')
-    if i >= len(listed_starts_index):
-        return None
-    return listed_starts_index[i]
-
-def entries_exits_from_signal(signal_series):
-    """
-    Return pairs (entry_signal_date, exit_signal_date_or_None) from a binary signal.
-    Signal is shifted by 1 day inside.
+    Strict: détecte les paires (entry_signal_date, exit_signal_date_or_None)
+    à partir d'un signal binaire 0/1.
+    -> Décale le signal d’un jour pour éviter le look-ahead.
+    -> Entry = 0->1 ; Exit = 1->0 (la première après l’entry).
     """
     sig = signal_series.shift(1).fillna(0).astype(int)
-    # entries = 0->1, exits = 1->0
     entries = sig[(sig == 1) & (sig.shift(1).fillna(0) == 0)].index
     exits   = sig[(sig == 0) & (sig.shift(1).fillna(0) == 1)].index
 
@@ -36,265 +17,103 @@ def entries_exits_from_signal(signal_series):
     exit_iter = iter(exits)
     cur_exit = next(exit_iter, None)
     for e in entries:
-        # move exit pointer forward until it's after entry
         while cur_exit is not None and cur_exit <= e:
             cur_exit = next(exit_iter, None)
-        pairs.append((e, cur_exit))  # may be None if no later exit
+        pairs.append((e, cur_exit))  # peut être None si pas d’exit après
     return pairs
 
-def build_trades_and_pnl_timeseries(
-    signal_series,
-    option_df,
-    start_expiry_dates,
-    fv_col="FV",
-    max_forward_gap_days=None,
-    forbid_overlap=True
+def build_trades_and_pnl_timeseries_strict(
+    signal_series: pd.Series,
+    option_df: pd.DataFrame,
+    fv_col: str = "FV",
+    forbid_overlap: bool = True
 ):
     """
-    option_df: daily rows for ONE underlying & ONE range, with columns:
-        ['startDate','endDate','date', fv_col, ...]
-        For each startDate there is exactly one endDate=expiry; rows between start..expiry inclusive.
-    start_expiry_dates: list of (start, expiry) for the *listing* convention you want to honour.
-    Returns:
-      trades_df: rows = trades with [entry_signal_date, startDate, exitDate, expiry, entry_FV, exit_FV]
-      pnl_ts:    concatenated daily MTM PnL series across all trades (index=date, column='MTM')
+    STRICT ALIGNMENT:
+      - On ne prend un trade que si un contrat existe avec startDate == entry_signal_date
+      - Exit = min(exit_signal_date, expiry) ; si pas d’exit, on tient jusqu’à expiry
+      - Pas de 'snap' vers un autre startDate.
+
+    option_df (UN seul underlying & range) doit contenir :
+      ['startDate','endDate','date', fv_col, ...]
+      Pour chaque startDate, exactement un endDate (=expiry).
+      'date' couvre toutes les dates de startDate à endDate incluses.
+
+    Retourne:
+      trades_df: [entry_signal_date, startDate, expiry, exitDate, entry_FV, exit_FV, PnL]
+      pnl_ts:    série daily MTM (index=date, col='MTM') concaténée sur tous les trades
     """
-    option_df = option_df.copy()
-    option_df["startDate"] = pd.to_datetime(option_df["startDate"])
-    option_df["endDate"]   = pd.to_datetime(option_df["endDate"])
-    option_df["date"]      = pd.to_datetime(option_df["date"])
+    df = option_df.copy()
+    df["startDate"] = pd.to_datetime(df["startDate"])
+    df["endDate"]   = pd.to_datetime(df["endDate"])
+    df["date"]      = pd.to_datetime(df["date"])
 
-    # map listing starts -> expiry we accept
-    start_to_expiry = make_start_to_expiry_map(start_expiry_dates)
-    listed_starts = pd.DatetimeIndex(sorted(start_to_expiry.keys()))
-
-    # 1) pairs from signal (entry_signal, exit_signal_or_None)
     sig_pairs = entries_exits_from_signal(signal_series)
 
     trades = []
+    pnl_chunks = []
     last_exit_taken = None
 
     for entry_sig, exit_sig in sig_pairs:
-        # 2) snap entry to next listed start >= entry_sig
-        snapped_start = next_listing_on_or_after(entry_sig, listed_starts)
-        if snapped_start is None:
-            continue
-        if max_forward_gap_days is not None and (snapped_start - entry_sig).days > max_forward_gap_days:
+        entry_sig = pd.to_datetime(entry_sig)
+        exit_sig  = pd.to_datetime(exit_sig) if exit_sig is not None else None
+
+        # STRICT: il faut un contrat qui commence EXACTEMENT à entry_sig
+        sub_all = df[df["startDate"] == entry_sig]
+        if sub_all.empty:
+            # aucun contrat listé ce jour-là → on ignore ce signal
             continue
 
-        expiry = start_to_expiry.get(snapped_start, None)
-        if expiry is None:
-            continue
+        # on suppose un seul expiry pour ce startDate
+        expiry = sub_all["endDate"].iloc[0]
 
-        # 3) exit = min(exit_sig, expiry)  (if no exit_sig, hold to expiry)
+        # exit = min(exit_sig, expiry) ; si pas d’exit → expiry
         if exit_sig is None or exit_sig > expiry:
             exit_date = expiry
         else:
             exit_date = exit_sig
 
-        # 4) avoid overlapping positions if requested
-        if forbid_overlap and last_exit_taken is not None and snapped_start <= last_exit_taken:
-            # skip this entry to avoid stacking overlapping trades
+        # éviter les overlaps si demandé (une position à la fois)
+        if forbid_overlap and last_exit_taken is not None and entry_sig <= last_exit_taken:
             continue
 
-        # 5) slice the option daily path for that contract from start..exit_date
-        sub = option_df[(option_df["startDate"] == snapped_start) &
-                        (option_df["endDate"] == expiry)]
-        if sub.empty:
+        # chemin quotidien du trade
+        trade_path = sub_all[(sub_all["date"] >= entry_sig) & (sub_all["date"] <= exit_date)].sort_values("date")
+        if trade_path.empty:
+            continue
+        # s'assurer qu'on a bien les points d'entrée/sortie
+        if entry_sig not in set(trade_path["date"]) or exit_date not in set(trade_path["date"]):
             continue
 
-        # ensure we have both entry and exit rows
-        sub = sub[(sub["date"] >= snapped_start) & (sub["date"] <= exit_date)]
-        if sub.empty or (snapped_start not in set(sub["date"])) or (exit_date not in set(sub["date"])):
-            continue
+        entry_fv = float(trade_path.loc[trade_path["date"] == entry_sig, fv_col].iloc[0])
+        exit_fv  = float(trade_path.loc[trade_path["date"] == exit_date,   fv_col].iloc[0])
+        pnl      = exit_fv - entry_fv
 
-        entry_fv = float(sub.loc[sub["date"] == snapped_start, fv_col].iloc[0])
-        exit_fv  = float(sub.loc[sub["date"] == exit_date,   fv_col].iloc[0])
-
-        # daily MTM relative to entry
-        sub = sub.sort_values("date").copy()
-        sub["MTM"] = sub[fv_col] - entry_fv
+        # MTM quotidien relatif à l'entrée
+        tp = trade_path.copy()
+        tp["MTM"] = tp[fv_col] - entry_fv
 
         trades.append({
             "entry_signal_date": entry_sig,
-            "startDate": snapped_start,
+            "startDate": entry_sig,      # strict: start == entry
             "expiry": expiry,
             "exitDate": exit_date,
             "entry_FV": entry_fv,
             "exit_FV": exit_fv,
-            "PnL": exit_fv - entry_fv
+            "PnL": pnl
         })
-
-        # collect MTM series (we’ll concatenate later)
-        if "pnl_chunks" not in locals():
-            pnl_chunks = []
-        pnl_chunks.append(sub[["date","MTM"]])
+        pnl_chunks.append(tp[["date","MTM"]])
 
         last_exit_taken = exit_date
 
     trades_df = pd.DataFrame(trades).sort_values("startDate") if trades else pd.DataFrame(
         columns=["entry_signal_date","startDate","expiry","exitDate","entry_FV","exit_FV","PnL"]
     )
-
-    # Concatenate daily MTM across trades (multiple trades won’t overlap if forbid_overlap=True)
-    if 'pnl_chunks' in locals() and pnl_chunks:
-        pnl_ts = pd.concat(pnl_chunks).set_index("date").sort_index()
-    else:
-        pnl_ts = pd.DataFrame(columns=["MTM"]).set_index(pd.DatetimeIndex([]))
-
+    pnl_ts = (
+        pd.concat(pnl_chunks).set_index("date").sort_index()
+        if pnl_chunks else pd.DataFrame(columns=["MTM"])
+    )
     return trades_df, pnl_ts
----
-Case	Indicator Conditions	Product Suggestion (Construction)	Exit Condition	Why This Works
-Bull – Low IV – Strong Trend	Momentum > 0; Price above SMA50 > SMA200; ADX ≥ 20; IV in bottom 30%	Long Call (Δ≈0.35, DTE 30–60) or Bull Call Debit Spread (Buy Δ≈0.35 call, Sell Δ≈0.25 call, width 5–10% of spot)	Stop if premium loses 50% or trend breaks (price < SMA50). Exit at ≤21 DTE. Take profit at 50–75% of max gain.	Positive delta + long vega benefits from cheap options. Spread limits theta/cost.
-Bull – Neutral IV – Strong Trend	Same as above but IV in 30–70% range	Bull Call Debit Spread (Buy Δ≈0.35, Sell Δ≈0.25, width 5–10%, DTE 30–60)	Trend break or 40–50% loss. Exit at ≤21 DTE. TP at 50–75% of max profit.	Good balance of risk/reward when options are fairly priced.
-Bull – High IV – Strong Trend	Momentum > 0; Trend bullish; ADX ≥ 20; IV in top 30%	Bull Put Credit Spread (Sell Δ≈0.35 put, Buy Δ≈0.20 put, width 5–10%, DTE 30–45)	Stop if price closes below short strike or loss = 1.5× credit. Exit ≤21 DTE or TP 50–70% of credit.	Keeps bullish delta but profits from selling expensive volatility. Defined downside.
-Bull – Weak Trend	Momentum > 0; Trend unclear or ADX < 20	Conservative Bull Call Debit Spread (narrow width 3–6%, DTE 30–45) or No Trade	Exit if momentum flips negative or SMA50 breaks. TP 30–50% of max gain. Exit ≤21 DTE.	When conviction is low, keep exposure small and risk defined.
-Bear – Low IV – Strong Trend	Momentum < 0; Price < SMA50 < SMA200; ADX ≥ 20; IV low (≤30%)	Long Put (Δ≈–0.35, DTE 30–60) or Bear Put Debit Spread (Buy Δ≈–0.35, Sell Δ≈–0.25, width 5–10%)	Stop if premium loses 50% or trend breaks (price > SMA50). Exit ≤21 DTE. TP 50–75% of max gain.	Bearish delta + long vega benefits from cheap puts.
-Bear – Neutral IV – Strong Trend	Same as above but IV in 30–70%	Bear Put Debit Spread (Δ≈–0.35 vs –0.25, width 5–10%, DTE 30–60)	Trend break or 40–50% loss. Exit ≤21 DTE. TP 50–75%.	Controlled risk exposure with mid-range volatility.
-Bear – High IV – Strong Trend	Momentum < 0; Trend bearish; ADX ≥ 20; IV high (>70%)	Bear Call Credit Spread (Sell Δ≈–0.35 call, Buy Δ≈–0.20 call, width 5–10%, DTE 30–45)	Stop if price closes above short strike or loss = 1.5× credit. TP 50–70% credit. Exit ≤21 DTE.	Negative delta + short vega profits from high volatility in downtrends.
-Bear – Weak Trend	Momentum < 0; ADX < 20 or unclear trend	Conservative Bear Put Debit Spread (width 3–6%, DTE 30–45) or No Trade	Exit if momentum flips positive or SMA50 breaks up. TP 30–50%. Exit ≤21 DTE.	Reduces risk in choppy/noisy markets.
-Breakout Confirmation (Bull or Bear)	Price makes new 20-day high (bull) or low (bear), ADX rising, IV neutral–high	Directional Credit Spread: Bull → Bull Put Spread; Bear → Bear Call Spread (width 5–10%, DTE 30–45)	Exit if breakout fails (price back in range) or TP 60–70% credit. Risk = 1.5× credit.	Credit spreads monetize volatility during strong breakouts.
-No Trade (Momentum Off)	ADX < 12 and momentum sign unstable; conflicting signals	Stay flat or switch to mean-reversion book	Wait until ADX ≥ 15–20 and momentum stabilizes	Avoids theta bleed and whipsaws in directionless markets.
-
-<img width="945" height="767" alt="image" src="https://github.com/user-attachments/assets/7739591a-857f-4fb2-960d-5f1479fdee47" />
-
-
-import pandas as pd
-
-# ==== Helpers ====
-def _norm_side(x):
-    x = str(x).upper()
-    if x in ['B', 'BUY', '1', 'LONG']:
-        return 'BUY'
-    if x in ['S', 'SELL', '-1', 'SHORT']:
-        return 'SELL'
-    return x
-
-def _norm_opt(x):
-    x = str(x).upper()
-    if x.startswith('C'):
-        return 'CALL'
-    if x.startswith('P'):
-        return 'PUT'
-    return x
-
-def _to_dt(x):
-    return pd.to_datetime(x).normalize()
-
-def classify_spread_type(legs_df: pd.DataFrame) -> str:
-    """
-    legs_df: DataFrame (2 lignes) pour un quote_id donné, colonnes minimales:
-      ['option_type', 'side', 'strike', 'expiry']
-    Règles demandées:
-      - Call/Put Vertical Bull/Bear (même expiry, strikes ≠)
-      - Call/Put Calendar (même strike, expiry ≠)
-      - Diagonals (strike ≠ & expiry ≠) -> 'OTHER' (à exclure plus tard)
-      - Tout le reste -> 'OTHER'
-    """
-    df = legs_df.copy()
-
-    # Normalisations
-    df['option_type'] = df['option_type'].map(_norm_opt)
-    df['side']        = df['side'].map(_norm_side)
-    df['expiry']      = df['expiry'].map(_to_dt)
-    df['strike']      = pd.to_numeric(df['strike'], errors='coerce')
-
-    # Garde uniquement 2 jambes valides
-    df = df.dropna(subset=['option_type','side','strike','expiry'])
-    if len(df) != 2 or not set(df['side']).issubset({'BUY','SELL'}):
-        return 'OTHER'
-
-    # Décompose
-    buy  = df[df['side']=='BUY'].iloc[0]  if (df['side']=='BUY').any()  else None
-    sell = df[df['side']=='SELL'].iloc[0] if (df['side']=='SELL').any() else None
-    if buy is None or sell is None:
-        return 'OTHER'
-
-    opt_buy,  opt_sell  = buy['option_type'],  sell['option_type']
-    k_buy,    k_sell    = float(buy['strike']), float(sell['strike'])
-    t_buy,    t_sell    = buy['expiry'],        sell['expiry']
-
-    same_strike = (k_buy == k_sell)
-    same_expiry = (t_buy == t_sell)
-
-    # ---- Calendars (même strike, expiries ≠) ----
-    if same_strike and not same_expiry:
-        if opt_buy == 'CALL' and opt_sell == 'CALL':
-            return 'CALL CALENDAR SPREAD'
-        if opt_buy == 'PUT'  and opt_sell == 'PUT':
-            return 'PUT CALENDAR SPREAD'
-        # si mix d'option_type (anormal) -> OTHER
-        return 'OTHER'
-
-    # ---- Verticals (même expiry, strikes ≠) ----
-    if same_expiry and not same_strike:
-        # CALL verticals
-        if opt_buy == 'CALL' and opt_sell == 'CALL':
-            # Bear = BUY high, SELL low ; Bull = SELL high, BUY low
-            if k_buy > k_sell:
-                return 'CALL SPREAD BEAR'
-            elif k_sell > k_buy:
-                return 'CALL SPREAD BULL'
-            else:
-                return 'OTHER'
-        # PUT verticals
-        if opt_buy == 'PUT' and opt_sell == 'PUT':
-            if k_buy > k_sell:
-                return 'PUT SPREAD BEAR'
-            elif k_sell > k_buy:
-                return 'PUT SPREAD BULL'
-            else:
-                return 'OTHER'
-        # mix CALL/PUT au même expiry -> OTHER
-        return 'OTHER'
-
-    # ---- Diagonals (strikes ≠ & expiries ≠) -> OTHER (à exclure plus tard) ----
-    if (not same_strike) and (not same_expiry):
-        return 'OTHER'
-
-    # Cas résiduels
-    return 'OTHER'
-
-
-# ==== Pipeline d’annotation ====
-# data_2 contient les jambes (legs) avec au moins: quote_id, option_type, side, strike, expiry
-# FINAL_data contient au moins: quote_id
-
-def build_strategy_types(FINAL_data: pd.DataFrame, data_2: pd.DataFrame) -> pd.DataFrame:
-    # restreindre aux legs d'options (si tu as aussi des futures/autres)
-    legs = data_2.copy()
-
-    # Optionnel: ne garder que CALL/PUT
-    legs = legs[legs['option_type'].astype(str).str.upper().str.startswith(('C','P'))]
-
-    # On garde uniquement les quotes qui ont 2 jambes
-    leg_counts = legs.groupby('quote_id').size()
-    valid_quotes = leg_counts[leg_counts == 2].index
-
-    legs2 = legs[legs['quote_id'].isin(valid_quotes)].copy()
-
-    # Classifier par quote_id
-    strategy_rows = []
-    for qid, g in legs2.groupby('quote_id'):
-        stype = classify_spread_type(g)
-        strategy_rows.append({'quote_id': qid, 'STRATEGY_TYPE': stype})
-
-    strat_df = pd.DataFrame(strategy_rows)
-
-    # Merge dans FINAL_data
-    out = FINAL_data.merge(strat_df, on='quote_id', how='left')
-
-    # Par défaut, remplir manquants en OTHER
-    out['STRATEGY_TYPE'] = out['STRATEGY_TYPE'].fillna('OTHER')
-
-    return out
-
-# ==== Exemple d’utilisation ====
-# FINAL_data = build_strategy_types(FINAL_data, data_2)
-
-# ---- Ensuite, pour "enlever" les diagonals (déjà marquées OTHER) ----
-# out_no_diagonals = FINAL_data[FINAL_data['STRATEGY_TYPE'] != 'OTHER'].copy()
-
 ----
 import pandas as pd
 
