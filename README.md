@@ -1,4 +1,43 @@
 
+def get_trades_from_signal_with_expiry(signal_series: pd.Series, start_expiry_map: dict):
+    """
+    Transforme un signal binaire (0/1) en couples (entry_date, exit_date),
+    avec un décalage de 1 jour et en forçant la sortie à l'expiry du contrat.
+    """
+    sig = signal_series.shift(1).fillna(0).astype(int)
+
+    trades = []
+    in_trade = False
+    entry_date = None
+    expiry_date = None
+
+    for date, val in sig.items():
+        if not in_trade and val == 1:
+            # entrer seulement si c'est une startDate valide
+            if date in start_expiry_map:
+                in_trade = True
+                entry_date = date
+                expiry_date = start_expiry_map[date]
+
+        elif in_trade:
+            # sortie anticipée si le signal repasse à 0 avant l'expiry
+            if val == 0 and date <= expiry_date:
+                trades.append((entry_date, date))
+                in_trade = False
+                entry_date, expiry_date = None, None
+
+            # sortie forcée si on atteint l'expiry
+            elif date == expiry_date:
+                trades.append((entry_date, date))
+                in_trade = False
+                entry_date, expiry_date = None, None
+
+    # trade ouvert non clôturé → sortir à l'expiry
+    if in_trade:
+        trades.append((entry_date, expiry_date))
+
+    return trades
+-----
 import pandas as pd
 
 def compute_trade_pnls(option_df, trades, fv_col="FV", forbid_overlap=True):
