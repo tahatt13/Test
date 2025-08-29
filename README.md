@@ -1,3 +1,65 @@
+
+import pandas as pd
+
+def get_trades_from_signal_with_expiry(signal_series: pd.Series, start_expiry_map: dict):
+    """
+    Transforme un signal binaire (0/1) en couples (entry_date, exit_date),
+    mais en bornant toujours la sortie par l'expiry du contrat.
+
+    signal_series: pandas Series binaire (0/1) indexée par dates
+    start_expiry_map: dict {startDate: expiryDate} pour tous les starts possibles
+
+    Retourne une liste de tuples (entry_date, exit_date, expiry_date)
+    """
+    # Décaler le signal d’un jour (on agit le jour suivant)
+    sig = signal_series.shift(1).fillna(0).astype(int)
+
+    trades = []
+    in_trade = False
+    entry_date = None
+    expiry_date = None
+
+    for date, val in sig.items():
+        if not in_trade and val == 1:
+            # On entre seulement si la date est bien un start listé
+            if date in start_expiry_map:
+                in_trade = True
+                entry_date = date
+                expiry_date = start_expiry_map[date]
+
+        elif in_trade:
+            # Cas 1 : signal repasse à 0 avant l’expiry -> sortie anticipée
+            if val == 0 and date <= expiry_date:
+                trades.append((entry_date, date, expiry_date))
+                in_trade = False
+                entry_date = None
+                expiry_date = None
+
+            # Cas 2 : on atteint l’expiry -> sortie forcée
+            elif date == expiry_date:
+                trades.append((entry_date, date, expiry_date))
+                in_trade = False
+                entry_date = None
+                expiry_date = None
+
+    # Si jamais un trade n’a pas été fermé (devrait être rare car expiry force la sortie)
+    if in_trade:
+        trades.append((entry_date, expiry_date, expiry_date))
+
+    return trades
+
+
+def get_trades_from_signals_with_expiry(signals_df: pd.DataFrame, start_expiry_map: dict):
+    """
+    Applique la logique à un DataFrame avec plusieurs assets en colonnes.
+    Retourne un dict {asset: [(entry, exit, expiry), ...]}.
+    """
+    results = {}
+    for col in signals_df.columns:
+        results[col] = get_trades_from_signal_with_expiry(signals_df[col], start_expiry_map)
+    return results
+
+----
 import pandas as pd
 
 def make_expiry_map(entry_exit_dates):
