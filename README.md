@@ -1,4 +1,93 @@
+import pandas as pd
 
+def make_expiry_map(entry_exit_dates):
+    """
+    entry_exit_dates: list of (start, expiry) for ALL possible starts in your backtest
+    Returns: dict {startDate: expiryDate}
+    """
+    df = pd.DataFrame(entry_exit_dates, columns=["startDate","expiry"])
+    df["startDate"] = pd.to_datetime(df["startDate"])
+    df["expiry"]    = pd.to_datetime(df["expiry"])
+    # if duplicates, keep first (or change keep="last")
+    df = df.drop_duplicates(subset=["startDate"], keep="first").sort_values("startDate")
+    return df.set_index("startDate")["expiry"].to_dict()
+
+def adjust_trades_with_expiry_map(trades, expiry_map):
+    """
+    trades: list of (entry, exit) from your signal (already shifted)
+    expiry_map: dict {startDate: expiryDate}
+    Returns: list of (entry, exit_capped, expiry) keeping only entries that exist in the map
+    """
+    out = []
+    for entry, exit_ in trades:
+        entry = pd.to_datetime(entry)
+        exit_ = pd.to_datetime(exit_) if exit_ is not None else None
+        expiry = expiry_map.get(entry)
+        if expiry is None:
+            # no listed contract starting exactly at 'entry' → strict alignment: skip
+            continue
+        if exit_ is None or exit_ > expiry:
+            exit_capped = expiry
+        else:
+            exit_capped = exit_
+        out.append((entry, exit_capped, expiry))
+    return out
+
+def trades_and_mtm_from_adjusted(option_df, adjusted_trades, fv_col="FV", forbid_overlap=True):
+    """
+    option_df: rows for ONE underlying & ONE range with ['startDate','endDate','date', fv_col, ...]
+    adjusted_trades: list of (entry, exit_capped, expiry)
+    Returns:
+      trades_df and daily MTM series concatenated across trades
+    """
+    df = option_df.copy()
+    df["startDate"] = pd.to_datetime(df["startDate"])
+    df["endDate"]   = pd.to_datetime(df["endDate"])
+    df["date"]      = pd.to_datetime(df["date"])
+
+    trades_rows, pnl_chunks = [], []
+    last_exit = None
+
+    for entry, exit_capped, expiry in adjusted_trades:
+        # strict: must match startDate exactly
+        sub = df[(df["startDate"] == entry) & (df["endDate"] == expiry)]
+        if sub.empty:
+            continue
+
+        if forbid_overlap and last_exit is not None and entry <= last_exit:
+            continue
+
+        path = sub[(sub["date"] >= entry) & (sub["date"] <= exit_capped)].sort_values("date")
+        if path.empty or entry not in set(path["date"]) or exit_capped not in set(path["date"]):
+            continue
+
+        entry_fv = float(path.loc[path["date"] == entry, fv_col].iloc[0])
+        exit_fv  = float(path.loc[path["date"] == exit_capped, fv_col].iloc[0])
+        pnl = exit_fv - entry_fv
+
+        tp = path.copy()
+        tp["MTM"] = tp[fv_col] - entry_fv
+        pnl_chunks.append(tp[["date","MTM"]])
+
+        trades_rows.append({
+            "entry": entry,
+            "exit": exit_capped,
+            "expiry": expiry,
+            "entry_FV": entry_fv,
+            "exit_FV": exit_fv,
+            "PnL": pnl
+        })
+        last_exit = exit_capped
+
+    trades_df = pd.DataFrame(trades_rows).sort_values("entry") if trades_rows else pd.DataFrame(
+        columns=["entry","exit","expiry","entry_FV","exit_FV","PnL"]
+    )
+    pnl_ts = (
+        pd.concat(pnl_chunks).set_index("date").sort_index()
+        if pnl_chunks else pd.DataFrame(columns=["MTM"])
+    )
+    return trades_df, pnl_ts
+----
 
 import pandas as pd
 
