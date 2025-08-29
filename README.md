@@ -1,3 +1,149 @@
+
+
+import numpy as np
+import pandas as pd
+
+def make_start_to_expiry_map(start_expiry_dates):
+    """
+    start_expiry_dates: iterable of (start, expiry) pairs (datetime-like)
+    returns: dict {startDate: expiryDate} with DatetimeIndex for keys
+    """
+    df = pd.DataFrame(start_expiry_dates, columns=["startDate","expiry"])
+    df["startDate"] = pd.to_datetime(df["startDate"])
+    df["expiry"]    = pd.to_datetime(df["expiry"])
+    # if multiple entries per start, keep the first (or last) – here first:
+    df = df.drop_duplicates(subset=["startDate"], keep="first").sort_values("startDate")
+    return df.set_index("startDate")["expiry"].to_dict()
+
+def next_listing_on_or_after(d, listed_starts_index):
+    """listed_starts_index: DatetimeIndex sorted (unique startDate values)"""
+    i = np.searchsorted(listed_starts_index.values, np.datetime64(d), side='left')
+    if i >= len(listed_starts_index):
+        return None
+    return listed_starts_index[i]
+
+def entries_exits_from_signal(signal_series):
+    """
+    Return pairs (entry_signal_date, exit_signal_date_or_None) from a binary signal.
+    Signal is shifted by 1 day inside.
+    """
+    sig = signal_series.shift(1).fillna(0).astype(int)
+    # entries = 0->1, exits = 1->0
+    entries = sig[(sig == 1) & (sig.shift(1).fillna(0) == 0)].index
+    exits   = sig[(sig == 0) & (sig.shift(1).fillna(0) == 1)].index
+
+    pairs = []
+    exit_iter = iter(exits)
+    cur_exit = next(exit_iter, None)
+    for e in entries:
+        # move exit pointer forward until it's after entry
+        while cur_exit is not None and cur_exit <= e:
+            cur_exit = next(exit_iter, None)
+        pairs.append((e, cur_exit))  # may be None if no later exit
+    return pairs
+
+def build_trades_and_pnl_timeseries(
+    signal_series,
+    option_df,
+    start_expiry_dates,
+    fv_col="FV",
+    max_forward_gap_days=None,
+    forbid_overlap=True
+):
+    """
+    option_df: daily rows for ONE underlying & ONE range, with columns:
+        ['startDate','endDate','date', fv_col, ...]
+        For each startDate there is exactly one endDate=expiry; rows between start..expiry inclusive.
+    start_expiry_dates: list of (start, expiry) for the *listing* convention you want to honour.
+    Returns:
+      trades_df: rows = trades with [entry_signal_date, startDate, exitDate, expiry, entry_FV, exit_FV]
+      pnl_ts:    concatenated daily MTM PnL series across all trades (index=date, column='MTM')
+    """
+    option_df = option_df.copy()
+    option_df["startDate"] = pd.to_datetime(option_df["startDate"])
+    option_df["endDate"]   = pd.to_datetime(option_df["endDate"])
+    option_df["date"]      = pd.to_datetime(option_df["date"])
+
+    # map listing starts -> expiry we accept
+    start_to_expiry = make_start_to_expiry_map(start_expiry_dates)
+    listed_starts = pd.DatetimeIndex(sorted(start_to_expiry.keys()))
+
+    # 1) pairs from signal (entry_signal, exit_signal_or_None)
+    sig_pairs = entries_exits_from_signal(signal_series)
+
+    trades = []
+    last_exit_taken = None
+
+    for entry_sig, exit_sig in sig_pairs:
+        # 2) snap entry to next listed start >= entry_sig
+        snapped_start = next_listing_on_or_after(entry_sig, listed_starts)
+        if snapped_start is None:
+            continue
+        if max_forward_gap_days is not None and (snapped_start - entry_sig).days > max_forward_gap_days:
+            continue
+
+        expiry = start_to_expiry.get(snapped_start, None)
+        if expiry is None:
+            continue
+
+        # 3) exit = min(exit_sig, expiry)  (if no exit_sig, hold to expiry)
+        if exit_sig is None or exit_sig > expiry:
+            exit_date = expiry
+        else:
+            exit_date = exit_sig
+
+        # 4) avoid overlapping positions if requested
+        if forbid_overlap and last_exit_taken is not None and snapped_start <= last_exit_taken:
+            # skip this entry to avoid stacking overlapping trades
+            continue
+
+        # 5) slice the option daily path for that contract from start..exit_date
+        sub = option_df[(option_df["startDate"] == snapped_start) &
+                        (option_df["endDate"] == expiry)]
+        if sub.empty:
+            continue
+
+        # ensure we have both entry and exit rows
+        sub = sub[(sub["date"] >= snapped_start) & (sub["date"] <= exit_date)]
+        if sub.empty or (snapped_start not in set(sub["date"])) or (exit_date not in set(sub["date"])):
+            continue
+
+        entry_fv = float(sub.loc[sub["date"] == snapped_start, fv_col].iloc[0])
+        exit_fv  = float(sub.loc[sub["date"] == exit_date,   fv_col].iloc[0])
+
+        # daily MTM relative to entry
+        sub = sub.sort_values("date").copy()
+        sub["MTM"] = sub[fv_col] - entry_fv
+
+        trades.append({
+            "entry_signal_date": entry_sig,
+            "startDate": snapped_start,
+            "expiry": expiry,
+            "exitDate": exit_date,
+            "entry_FV": entry_fv,
+            "exit_FV": exit_fv,
+            "PnL": exit_fv - entry_fv
+        })
+
+        # collect MTM series (we’ll concatenate later)
+        if "pnl_chunks" not in locals():
+            pnl_chunks = []
+        pnl_chunks.append(sub[["date","MTM"]])
+
+        last_exit_taken = exit_date
+
+    trades_df = pd.DataFrame(trades).sort_values("startDate") if trades else pd.DataFrame(
+        columns=["entry_signal_date","startDate","expiry","exitDate","entry_FV","exit_FV","PnL"]
+    )
+
+    # Concatenate daily MTM across trades (multiple trades won’t overlap if forbid_overlap=True)
+    if 'pnl_chunks' in locals() and pnl_chunks:
+        pnl_ts = pd.concat(pnl_chunks).set_index("date").sort_index()
+    else:
+        pnl_ts = pd.DataFrame(columns=["MTM"]).set_index(pd.DatetimeIndex([]))
+
+    return trades_df, pnl_ts
+---
 Case	Indicator Conditions	Product Suggestion (Construction)	Exit Condition	Why This Works
 Bull – Low IV – Strong Trend	Momentum > 0; Price above SMA50 > SMA200; ADX ≥ 20; IV in bottom 30%	Long Call (Δ≈0.35, DTE 30–60) or Bull Call Debit Spread (Buy Δ≈0.35 call, Sell Δ≈0.25 call, width 5–10% of spot)	Stop if premium loses 50% or trend breaks (price < SMA50). Exit at ≤21 DTE. Take profit at 50–75% of max gain.	Positive delta + long vega benefits from cheap options. Spread limits theta/cost.
 Bull – Neutral IV – Strong Trend	Same as above but IV in 30–70% range	Bull Call Debit Spread (Buy Δ≈0.35, Sell Δ≈0.25, width 5–10%, DTE 30–60)	Trend break or 40–50% loss. Exit at ≤21 DTE. TP at 50–75% of max profit.	Good balance of risk/reward when options are fairly priced.
