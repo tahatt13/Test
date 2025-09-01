@@ -3,28 +3,31 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-def strategy_heatmaps(
+def strategy_heatmaps_one_per_line(
     df,
     cluster_id=None,
-    strategies=None,
-    strike_bins=None,                 # numeric bin edges
-    strike_labels=None,               # optional labels
+    strategies=None,              # list of str, or None for top N
+    top_strategies=6,             # if strategies=None
+    strike_bins=None,
+    strike_labels=None,
     tenor_bins_bd=[0,21,63,126,252,504,756],
     tenor_labels=['<1M','1–3M','3–6M','6–12M','1–2Y','2–3Y'],
     normalize=True,
-    min_cell_value=0.01               # if normalized, hide labels < 1%
+    label_min_pct=0.02,           # show labels ≥ 2% only
+    figsize_per=(10,4)            # width, height per heatmap
 ):
     d = df.copy()
 
+    # filter on cluster
     if cluster_id is not None and 'cluster_kmeans' in d.columns:
         d = d[d['cluster_kmeans'] == cluster_id].copy()
 
-    # numeric-safe
+    # numeric safe
     for c in ['NOTIONAL_USD','STRIKE_PCT','STRIKE_2','MATURITY_in_BDAYS','MATURITY_WIDTH','NUMBER_OF_LEGS']:
         if c in d.columns:
             d[c] = pd.to_numeric(d[c], errors='coerce')
 
-    # midpoints (single vs multi)
+    # midpoints
     is_single = (d['NUMBER_OF_LEGS'] == 1)
     d['_strike_mid'] = np.where(is_single, d['STRIKE_PCT'],
                                 (d['STRIKE_PCT'] + d['STRIKE_2'])/2.0)
@@ -35,79 +38,70 @@ def strategy_heatmaps(
 
     # buckets
     if strike_bins is None:
-        strike_bins = np.arange(60, 141, 5)
+        strike_bins = np.arange(90, 111, 2)  # tighter range around ATM
     d['_strike_bucket'] = pd.cut(d['_strike_mid'], bins=strike_bins, include_lowest=True,
-                                 labels=strike_labels if strike_labels is not None else None, right=False)
+                                 labels=strike_labels if strike_labels else None, right=False)
     d['_tenor_bucket']  = pd.cut(d['_mat_mid_bd'], bins=tenor_bins_bd, include_lowest=True,
                                  labels=tenor_labels, right=False)
 
-    d['_strike_bucket'] = d['_strike_bucket'].astype('category')
-    d['_tenor_bucket']  = d['_tenor_bucket'].astype('category')
-
-    # which strategies
-    all_strats = d['STRATEGY_TYPE'].dropna().unique().tolist()
+    # strategy selection
     if strategies is None:
-        strategies = all_strats
+        strat_order = (d.groupby('STRATEGY_TYPE')['NOTIONAL_USD']
+                         .sum().sort_values(ascending=False).index.tolist())
+        strategies = strat_order[:top_strategies]
     else:
-        strategies = [s for s in strategies if s in all_strats]
+        have = set(d['STRATEGY_TYPE'].unique())
+        strategies = [s for s in strategies if s in have]
+
     if not strategies:
         print("No matching STRATEGY_TYPE to plot."); return
 
-    n = len(strategies)
-    cols = 3
-    rows = int(np.ceil(n/cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(5*cols, 3.8*rows), squeeze=False)
-
-    vmax_global = None
+    # global vmax if not normalized
+    vmax_abs = 0.0
     if not normalize:
         tmp = (d.groupby(['STRATEGY_TYPE','_tenor_bucket','_strike_bucket'])['NOTIONAL_USD']
                  .sum().reset_index())
-        vmax_global = float(tmp['NOTIONAL_USD'].max())
+        vmax_abs = float(tmp['NOTIONAL_USD'].max())
+
+    # plot each strategy one per row
+    fig, axes = plt.subplots(len(strategies), 1,
+                             figsize=(figsize_per[0], figsize_per[1]*len(strategies)),
+                             squeeze=False)
 
     for i, strat in enumerate(strategies):
-        ax = axes[i//cols, i%cols]
+        ax = axes[i,0]
         dd = d[d['STRATEGY_TYPE'] == strat]
-        if dd.empty:
-            ax.axis('off'); ax.set_title(f"{strat} (no data)"); continue
 
         heat = (dd.groupby(['_tenor_bucket','_strike_bucket'])['NOTIONAL_USD']
-                  .sum().unstack(fill_value=0)).astype('float64')
+                  .sum().unstack(fill_value=0)).astype(float)
 
         annot = None
         if normalize:
-            denom = heat.values.sum()
-            if denom > 0:
-                heat = heat / denom
-
-            # optional masking of tiny cells
-            if min_cell_value > 0:
-                heat = heat.mask(heat < min_cell_value)
-
-            # build percentage labels like "12%" and hide where NaN/blank
-            annot = (heat * 100).round(0).astype('Int64').astype(str) + '%'
-            annot = annot.where(~heat.isna(), '')  # blank labels for masked cells
-
-            cbar_label = '% of strategy notional'
+            tot = heat.values.sum()
+            if tot > 0:
+                heat = heat / tot
+            # labels only for cells >= threshold
+            annot = (heat*100).round(0).astype('Int64').astype(str) + '%'
+            annot = annot.where(heat >= label_min_pct, '')
             vmin, vmax = 0, 1
+            cbar_label = "% of strategy notional"
         else:
-            cbar_label = 'Total notional (USD)'
-            vmin, vmax = 0, vmax_global
+            vmin, vmax = 0, vmax_abs
+            cbar_label = "Total notional (USD)"
 
         sns.heatmap(
-            heat, ax=ax, cmap='Blues', vmin=vmin, vmax=vmax,
-            cbar_kws={'label': cbar_label},
-            annot=annot if normalize else False, fmt='',  # show % only when normalized
-            annot_kws={'fontsize':9}
+            heat, ax=ax, cmap="Blues", vmin=vmin, vmax=vmax,
+            annot=annot if normalize else False, fmt='',
+            annot_kws={'fontsize':10},
+            linewidths=0.5, linecolor='white',
+            cbar_kws={'label': cbar_label}
         )
-        ax.set_title(strat)
-        ax.set_xlabel('Strike% bucket')
-        ax.set_ylabel('Tenor bucket')
+        ax.set_title(strat, fontsize=13, pad=8)
+        ax.set_xlabel("Strike% bucket")
+        ax.set_ylabel("Tenor bucket")
+        ax.tick_params(axis='x', labelrotation=45, labelsize=9)
+        ax.tick_params(axis='y', labelsize=9)
 
-    # hide empty subplots
-    last = i
-    for j in range(last+1, rows*cols):
-        axes[j//cols, j%cols].axis('off')
-
-    fig.suptitle("Strike% × Tenor – Notional per strategy", fontsize=14)
-    plt.tight_layout(rect=[0,0,1,0.96])
+    fig.suptitle("Strike% × Tenor – Notional per Strategy", fontsize=15, y=1.02)
+    plt.tight_layout()
     plt.show()
