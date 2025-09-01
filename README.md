@@ -1,3 +1,22 @@
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+# Suppose you already have `top3_notional` with columns:
+# STRATEGY_TYPE, UNDERLYING_INSTRUMENT_NAME, total_notional
+
+plt.figure(figsize=(12,6))
+sns.barplot(data=top3_notional,
+            x="total_notional", y="STRATEGY_TYPE",
+            hue="UNDERLYING_INSTRUMENT_NAME", orient="h")
+
+plt.title("Top 3 Underlyings by Strategy (Notional)", fontsize=14)
+plt.xlabel("Total Notional (USD)")
+plt.ylabel("Strategy")
+plt.legend(title="Underlying", bbox_to_anchor=(1.05,1), loc="upper left")
+plt.tight_layout()
+plt.show()
+
+--------
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
