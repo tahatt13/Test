@@ -1,3 +1,69 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# start from your result
+g = (cluster_16
+     .groupby(['STRATEGY_TYPE','UNDERLYING_INSTRUMENT_NAME'])['NOTIONAL_USD']
+     .sum().reset_index())
+
+# total notional per strategy (for sorting and “Other”)
+tot = g.groupby('STRATEGY_TYPE')['NOTIONAL_USD'].sum().rename('TOTAL')
+g = g.merge(tot, on='STRATEGY_TYPE')
+g['share'] = g['NOTIONAL_USD'] / g['TOTAL']
+
+# keep top-3 underlyings per strategy, aggregate the rest as "Other"
+g_sorted = g.sort_values(['STRATEGY_TYPE','NOTIONAL_USD'], ascending=[True,False])
+top3 = g_sorted.groupby('STRATEGY_TYPE').head(3)
+other = (g_sorted.groupby('STRATEGY_TYPE').tail(len(g_sorted))
+         .groupby('STRATEGY_TYPE')
+         .apply(lambda x: 1 - x.nlargest(3, 'NOTIONAL_USD')['share'].sum())
+         .rename('share').reset_index())
+other['UNDERLYING_INSTRUMENT_NAME'] = 'Other'
+
+plotdf = pd.concat([
+    top3[['STRATEGY_TYPE','UNDERLYING_INSTRUMENT_NAME','share']],
+    other[['STRATEGY_TYPE','UNDERLYING_INSTRUMENT_NAME','share']]
+], ignore_index=True)
+
+# order strategies by total notional
+order = tot.sort_values(ascending=False).index.tolist()
+plotdf['STRATEGY_TYPE'] = pd.Categorical(plotdf['STRATEGY_TYPE'], order)
+
+# pivot to stacked 100% bars
+wide = (plotdf.pivot(index='STRATEGY_TYPE',
+                     columns='UNDERLYING_INSTRUMENT_NAME',
+                     values='share')
+        .fillna(0).sort_index())
+
+# plot
+fig, ax = plt.subplots(figsize=(12, 7))
+left = np.zeros(len(wide))
+for col in wide.columns:
+    ax.barh(wide.index.astype(str), wide[col].values, left=left, label=col)
+    left += wide[col].values
+
+# labels (% on segments that matter)
+for i, y in enumerate(wide.index):
+    cum = 0.0
+    for col in wide.columns:
+        val = wide.loc[y, col]
+        if val >= 0.08:  # show only meaningful pieces
+            ax.text(cum + val/2, i, f"{col} • {val:.0%}",
+                    ha='center', va='center', fontsize=9, color='white')
+        cum += val
+
+ax.set_title("Top Underlyings per Strategy — Share of Strategy Notional (100% = each strategy)", fontsize=14)
+ax.set_xlabel("Share of strategy notional")
+ax.set_xlim(0, 1)
+ax.legend(title="Underlying", bbox_to_anchor=(1.02, 1), loc="upper left")
+plt.tight_layout()
+plt.show()
+
+
+
+
+------
 import seaborn as sns
 import matplotlib.pyplot as plt
 
