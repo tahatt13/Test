@@ -1,3 +1,69 @@
+import pandas as pd
+import numpy as np
+
+def to_daily_pnl(pnl_ts, start=None, end=None, freq='B'):
+    """
+    Convert sparse MTM series (only in-trade days) into a continuous daily series.
+    Days without a position => equity is flat => daily return = 0.
+    """
+    s = pnl_ts["MTM"].copy()
+    s.index = pd.to_datetime(s.index)
+
+    if start is None:
+        start = s.index.min()
+    if end is None:
+        end = s.index.max()
+
+    # business-day calendar
+    cal = pd.bdate_range(start=start, end=end, freq=freq)
+
+    # equity = cumulative PnL; forward-fill across gaps; before first value -> 0
+    equity = s.cumsum().reindex(cal).ffill().fillna(0.0)
+
+    # daily PnL increments (returns); gaps become 0 because equity is flat
+    daily_pnl = equity.diff().fillna(0.0)
+
+    # return both for convenience
+    return pd.DataFrame({"Equity": equity, "DailyPnL": daily_pnl})
+
+import numpy as np
+
+def compute_sharpe_from_daily(daily_df, freq=252):
+    r = daily_df["DailyPnL"]
+    std = r.std()
+    return (r.mean() / std) * np.sqrt(freq) if std != 0 else np.nan
+
+def compute_metrics(trades_df, pnl_ts, start=None, end=None):
+    daily = to_daily_pnl(pnl_ts, start=start, end=end)
+    sharpe = compute_sharpe_from_daily(daily)
+    max_dd = (daily["Equity"] - daily["Equity"].cummax()).min()
+    return {
+        "Sharpe": sharpe,
+        "Cumulative PnL": float(daily["Equity"].iloc[-1]),
+        "Win Rate": (trades_df["PnL"] > 0).mean() if not trades_df.empty else np.nan,
+        "Average Trade PnL": trades_df["PnL"].mean() if not trades_df.empty else np.nan,
+        "Max Drawdown": float(max_dd),
+    }
+
+
+import matplotlib.pyplot as plt
+
+def plot_results(pnl_ts, trades_df, start=None, end=None):
+    daily = to_daily_pnl(pnl_ts, start=start, end=end)
+
+    plt.figure(figsize=(10,5))
+    daily["Equity"].plot(title="Equity Curve (business days)")
+    plt.ylabel("Cumulative PnL"); plt.xlabel("")
+    plt.tight_layout(); plt.show()
+
+    if not trades_df.empty:
+        plt.figure(figsize=(8,4))
+        trades_df["PnL"].hist(bins=20)
+        plt.title("Distribution of Trade PnLs"); plt.xlabel("PnL per trade")
+        plt.tight_layout(); plt.show()
+
+
+-----
 import matplotlib.pyplot as plt
 import seaborn as sns
 
